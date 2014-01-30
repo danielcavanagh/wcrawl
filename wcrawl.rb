@@ -11,8 +11,8 @@ $javascript = ''
 
 def usage
 	puts <<_EOU
-usage:  link_check [-csv] [-t <num>] [-o dir] <uri>
-        link_check [-cv] [-t <num>] -r
+usage:  wcrawl [-csv] [-t <num>] [-o dir] <uri>
+        wcrawl [-cv] [-t <num>] -r
 
         -c: check within comment tags (<!-- comment -->)
         -d: download and save to the current local directory
