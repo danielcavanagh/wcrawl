@@ -1,0 +1,146 @@
+#!/usr/bin/env ruby
+# encoding: utf-8
+
+require 'uri'
+require 'resolv'
+require './lib/wcrawl'
+
+Resume_file = 'wcrawl-save.yaml'
+
+queue = nil
+options = { recurse: true }
+target = nil
+
+def usage
+	puts <<_EOU
+usage:  wcrawl [-csv] [-t <num>] [-o dir] <uri>
+        wcrawl [-cv] [-t <num>] -r
+
+        -c: check within comment tags (<!-- comment -->)
+        -d: download and save to the current local directory
+        -o: match the validated urls against a local directory to discover orphaned pages
+        -r: resume an interrupted scan
+        -s: check just the first page (ie. not recursive)
+        -v: be verbose (eg. warn on improperly escaped urls, etc.)
+_EOU
+	exit
+end
+
+while arg = ARGV.shift
+	if arg[0] == '-'
+		arg[1..-1].each_char {|char|
+			case char
+			when 'c' then options[:check_comments] = true
+			when 'd' then options[:duplicate] = true
+			when 'o' then options[:orphans] = ARGV.shift
+			when 'r' then options[:resume] = true
+			when 's' then options[:recurse] = false
+			when 'v' then options[:verbose] = true
+			else usage
+			end
+		}
+    elsif not target and not options[:resume] then target = arg
+    else usage
+    end
+end
+usage if not target and not options[:resume]
+
+if options[:resume]
+	validated = {}
+	to_validate = {}
+	invalid = {}
+
+	# load the resume file
+	begin
+    YAML::load_file(Resume_file, aliases: true, permitted_classes: [Regexp, Symbol, URI::Generic, URI::HTTP, URI::HTTPS, URI::RFC3986_Parser, Wcrawl::LinkQueue, Wcrawl::LinkToLoad, Wcrawl::InvalidURI]) => { target:, queue: }
+	rescue Errno::ENOENT
+		puts "no resume file exists to resume with"
+		exit
+	end
+else
+	# note for the future: URI can't read uris unless they have a scheme, or // + path
+	target = 'http://' + target if target !~ /^\w+:\/\//
+	target = URI.parse(target)
+	target.path = '/' if target.path.empty?
+
+	queue = Wcrawl::LinkQueue.new(options)
+	uri = target.clone
+	uri.user = uri.password = nil
+	queue.add_uri(uri)
+end
+
+# attempt to get a list of aliases for the root host so we aren't confused when aliases are used
+$aliases = [target.host]
+begin
+	proper_name = Resolv.getname(Resolv.getaddress(target.host))
+	parts = proper_name.split('.', 2)
+	if parts.length > 1 and not target.host.include?('.')
+		$aliases << "#{target.host}.#{parts[1]}"
+		$aliases << parts[0]
+	end
+	$aliases << proper_name if proper_name != target.host
+rescue Resolv::ResolvError
+	# doesn't matter
+end
+puts "alternative hostnames for #{target.host}: #{$aliases.join(', ')}" if options[:verbose]
+
+using Wcrawl::Refinements
+
+uri = target.clone
+$roots = $aliases.map {|h|
+	Wcrawl::LinkToLoad.add_userpass(h, uri.user, uri.password) if uri.userinfo
+	uri.host = h
+	uri.dirname
+}
+
+begin
+	Dir.mkdir(target.host) if options[:duplicate]
+rescue Errno::EEXIST
+end
+
+begin
+	begin
+		queue.validate
+	rescue NoMemoryError
+		puts "out of memory\n"
+	end
+
+	puts if options[:verbose]
+	if queue.invalid.size > 0
+		puts 'broken links'
+		puts "------------\n"
+		queue.invalid.each_value {|uri| puts uri.error_message if uri.reason != Wcrawl::InvalidURI::Other_uri }
+		File.delete(Resume_file) if options[:resume]
+	else
+		puts 'no broken links'
+	end
+
+	if options[:orphans]
+		root = $roots[0][0..-2]
+		local_uris = queue.validated.keys.map {|uri|
+			uri.query = nil
+			uri.fragment = nil
+			uri.to_s.sub(root, '')
+		}.select {|uri| uri[0] == '/' }
+
+		page_list = []
+		Find.find(options[:orphans]) {|path|
+			path = path.sub(options[:orphans], '')
+			path = '/' + path if path[0] != '/'
+			page_list << path
+		}
+
+		puts "\norphaned files"
+		puts '--------------'
+		js_orphans = []
+		(page_list - local_uris).each {|orphan| puts orphan }
+	end
+rescue Exception
+	# save a resume file
+  f = File.open(Resume_file, 'w')
+  f.write(YAML::dump({ target: target, queue: queue }))
+  f.close
+	puts "a resume file has been created"
+
+	raise $! if $!.class != Interrupt
+end
